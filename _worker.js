@@ -231,7 +231,7 @@ export default {
 
   // 心跳提交：只有真实 commit 才会重置 GitHub 的 60 天空闲计时器，默认 20 天内不重复提交
   async heartbeatCommit(owner, repo, ref, token, maxAgeDays = 20) {
-    const api = `https://api.github.com/repos/${owner}/${repo}/contents/.keepalive`;
+    const api = `https://api.github.com/repos/${owner}/${repo}/contents/.syncaction`;
     const headers = {
       "Authorization": `Bearer ${token}`,
       "Accept": "application/vnd.github.v3+json",
@@ -260,7 +260,7 @@ export default {
 
     const now = new Date().toISOString();
     const body = {
-      message: `chore: keepalive ${now.slice(0, 10)}`,
+      message: `chore: syncaction ${now.slice(0, 10)}`,
       content: btoa(JSON.stringify({ updated_at: now })),
       branch: ref
     };

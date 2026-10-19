@@ -4,7 +4,7 @@
 ## ✨ 核心特性
 
 ### 🛡 保活功能
-- 🛡 **真实心跳提交**：通过 Contents API 更新 `.keepalive` 时间戳文件，产生真实 commit。GitHub 只认 commit / issue / PR 才算仓库活动，单纯触发 Workflow 不会重置 60 天计时器
+- 🛡 **真实心跳提交**：通过 Contents API 更新 `.syncaction` 时间戳文件，产生真实 commit。GitHub 只认 commit / issue / PR 才算仓库活动，单纯触发 Workflow 不会重置 60 天计时器
 - 🔁 **自动恢复**：Workflow 已被停用时自动调用 enable 接口重新启用再触发
 - ⏱ **提交节流**：同一仓库 20 天内不重复提交，不刷屏提交历史
 - 👥 **多用户管理**：支持添加多个 GitHub 用户，每个用户可独立配置 Token
@@ -120,7 +120,7 @@
 2. **权限要求**：
    - 保活功能：Token 需要有 `workflow` 权限和仓库内容读写权限（classic 勾 `repo` 或 `public_repo` + `workflow`）
    - 同步功能：Token 需要有仓库写入权限
-3. **心跳文件**：保活会在仓库根目录生成 `.keepalive`，内容只有更新时间戳，不要删除
+3. **心跳文件**：保活会在仓库根目录生成 `.syncaction`，内容只有更新时间戳，不要删除
 4. **分支保护**：如果目标分支开启了 "Require pull request before merging"，心跳提交会被 409 拒绝，需要放开或用不受保护的分支
 5. **同步频率**：合理设置同步频率，避免滥用 GitHub 资源
 6. **强制同步**：同步功能是强制覆盖目标分支，请确保你了解后果
