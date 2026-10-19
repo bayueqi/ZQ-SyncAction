@@ -1,10 +1,12 @@
-# 🤖 ZQ-KeepAction
+# 🤖 ZQ-SyncAction
 一款部署在 **Cloudflare Workers** 上的轻量脚本，专门解决 GitHub Action 定时任务因**60天无活动**被自动暂停的问题，同时支持**上游仓库自动同步**功能，全程利用免费资源，无需额外服务器。
 
 ## ✨ 核心特性
 
 ### 🛡 保活功能
-- 🛡 **精准防暂停**：调用 GitHub 官方 API 手动触发 Workflow，模拟真实活跃行为，合规有效
+- 🛡 **真实心跳提交**：通过 Contents API 更新 `.keepalive` 时间戳文件，产生真实 commit。GitHub 只认 commit / issue / PR 才算仓库活动，单纯触发 Workflow 不会重置 60 天计时器
+- 🔁 **自动恢复**：Workflow 已被停用时自动调用 enable 接口重新启用再触发
+- ⏱ **提交节流**：同一仓库 20 天内不重复提交，不刷屏提交历史
 - 👥 **多用户管理**：支持添加多个 GitHub 用户，每个用户可独立配置 Token
 - 📦 **多仓库管理**：每个用户可添加多个仓库，配置 Workflow、分支
 
@@ -29,7 +31,7 @@
 2. 左侧菜单栏最下方 → **Developer settings**
 3. 选择 **Personal access tokens** → **Tokens (classic)**
 4. 点击 **Generate new token (classic)**
-5. **Note**：自定义名称（例：`KeepAction`），便于识别
+5. **Note**：自定义名称（例：`SyncAction`），便于识别
 6. **Expiration**：建议选择 **No expiration**（永不过期），避免后续重复配置
 7. **Select scopes**（权限勾选，二选一）：
    - 公开仓库：勾选 `public_repo` + `workflow`
@@ -52,15 +54,15 @@
 为实现配置持久化，需通过 KV 存储持久化配置，步骤如下：
 1. 回到 Cloudflare 主面板，左侧菜单 → **Storage & Databases** → **KV**
 2. 点击 **Create Namespace**
-3. 自定义命名空间名称（例：`KeepAction`），点击 **Add** 完成创建
+3. 自定义命名空间名称（例：`SyncAction`），点击 **Add** 完成创建
 
 ### 3. 配置 Worker 绑定（关键步骤）
 回到你的 Worker 页面，点击 **Settings** → **Variables**，配置 KV 绑定：
 
 #### A. 绑定 KV 命名空间（必须配置）
 1. 找到 **KV Namespace Bindings** 区域，点击 **Add Binding**
-2. **Variable name**：**必须填写 `KeepAction`**（注意大小写！）
-3. **KV Namespace**：选择上一步创建的 KV 命名空间（例：`KeepAction`）
+2. **Variable name**：**必须填写 `SyncAction`**（注意大小写！）
+3. **KV Namespace**：选择上一步创建的 KV 命名空间（例：`SyncAction`）
 4. 点击 **Deploy** 保存绑定
 
 ---
@@ -69,7 +71,7 @@
 1. 回到 Worker 页面，点击 **Triggers** 选项卡
 2. 找到 **Cron Triggers** 区域，点击 **Add Cron Trigger**
 3. **Cron Expression**：根据需要设置频率
-   - 保活任务：建议每月一次
+   - 保活任务：建议每两周或每月一次（心跳自带 20 天节流，跑勤了也不会多提交）
    - 同步任务：建议每天一次（按需调整）
 
    > 注意：Worker 定时触发时会同时执行保活和同步两个任务
@@ -101,10 +103,9 @@
 1. 点击「+ 添加用户」
 2. 填写 **GitHub 用户名**（目标仓库的所有者）和 **GitHub Token**（有写入权限）
 3. 每个用户下点击「+ 添加仓库」，配置：
-   - **目标仓库名称**：你的仓库名
-   - **同步分支**：要同步的分支名（默认 `main`）
-   - **上游用户/组织**：上游仓库的所有者
-   - **上游仓库名**：上游仓库的名称
+   - **上游仓库**：填 `owner/repo`（例：`ZQ-ZQ/ZQ-Blog`，粘贴完整链接也能识别）
+   - **分支**：要同步的分支名（默认 `main`）
+   - **目标仓库**：你的仓库名
 4. 点击「🔄 立即同步」可手动测试
 
 5. 点击「💾 保存配置」保存所有设置
@@ -117,8 +118,10 @@
 ## ⚠️ 注意事项
 1. **Token 安全**：请妥善保管 GitHub Token，不要泄露给他人
 2. **权限要求**：
-   - 保活功能：Token 需要有 `workflow` 权限
+   - 保活功能：Token 需要有 `workflow` 权限和仓库内容读写权限（classic 勾 `repo` 或 `public_repo` + `workflow`）
    - 同步功能：Token 需要有仓库写入权限
-3. **同步频率**：合理设置同步频率，避免滥用 GitHub 资源
-4. **强制同步**：同步功能是强制覆盖目标分支，请确保你了解后果
-5. **配置结构**：保活配置在 `users` 中，同步配置在 `syncUsers` 中，两者都是「用户 → 仓库」层级结构，相互独立
+3. **心跳文件**：保活会在仓库根目录生成 `.keepalive`，内容只有更新时间戳，不要删除
+4. **分支保护**：如果目标分支开启了 "Require pull request before merging"，心跳提交会被 409 拒绝，需要放开或用不受保护的分支
+5. **同步频率**：合理设置同步频率，避免滥用 GitHub 资源
+6. **强制同步**：同步功能是强制覆盖目标分支，请确保你了解后果
+7. **配置结构**：保活配置在 `users` 中，同步配置在 `syncUsers` 中，两者都是「用户 → 仓库」层级结构，相互独立

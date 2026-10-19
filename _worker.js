@@ -41,8 +41,8 @@ export default {
   },
 
   async loadConfig(env) {
-    if (!env.KeepAction) return null;
-    const configStr = await env.KeepAction.get("config");
+    if (!env.SyncAction) return null;
+    const configStr = await env.SyncAction.get("config");
     if (!configStr) return null;
     try {
       return JSON.parse(configStr);
@@ -52,8 +52,8 @@ export default {
   },
 
   async saveConfigToKV(env, config) {
-    if (!env.KeepAction) return false;
-    await env.KeepAction.put("config", JSON.stringify(config));
+    if (!env.SyncAction) return false;
+    await env.SyncAction.put("config", JSON.stringify(config));
     return true;
   },
 
@@ -75,6 +75,16 @@ export default {
     const config = await this.loadConfig(env);
     
     if (!config) {
+      if (!env.SyncAction) {
+        return new Response(JSON.stringify({ 
+          success: false, 
+          message: "未绑定 KV 命名空间：请在 Worker 的 Settings → Variables 添加变量 SyncAction 并绑定 KV" 
+        }), {
+          headers: { "Content-Type": "application/json" },
+          status: 500
+        });
+      }
+      
       const newConfig = {
         password: password,
         tgToken: "",
@@ -82,7 +92,13 @@ export default {
         users: [],
         syncUsers: []
       };
-      await this.saveConfigToKV(env, newConfig);
+      const saved = await this.saveConfigToKV(env, newConfig);
+      if (!saved) {
+        return new Response(JSON.stringify({ success: false, message: "配置写入 KV 失败" }), {
+          headers: { "Content-Type": "application/json" },
+          status: 500
+        });
+      }
       return new Response(JSON.stringify({ success: true }), {
         headers: { "Content-Type": "application/json" }
       });
@@ -135,7 +151,13 @@ export default {
       syncUsers: body.syncUsers || []
     };
     
-    await this.saveConfigToKV(env, newConfig);
+    const saved = await this.saveConfigToKV(env, newConfig);
+    if (!saved) {
+      return new Response(JSON.stringify({ success: false, message: "KV 未绑定，配置无法保存" }), {
+        headers: { "Content-Type": "application/json" },
+        status: 500
+      });
+    }
     return new Response(JSON.stringify({ success: true }), {
       headers: { "Content-Type": "application/json" }
     });
@@ -177,24 +199,15 @@ export default {
         try {
           const workflow = repo.workflow || "main.yml";
           const ref = repo.ref || "main";
-          const url = `https://api.github.com/repos/${user.name}/${repo.name}/actions/workflows/${workflow}/dispatches`;
-          
-          const response = await fetch(url, {
-            method: "POST",
-            headers: {
-              "Authorization": `Bearer ${user.token}`,
-              "Accept": "application/vnd.github.v3+json",
-              "User-Agent": "CF-Worker-KeepAlive"
-            },
-            body: JSON.stringify({ ref: ref })
-          });
 
-          if (response.status === 204) {
-            successCount++;
-            report.push(`✅ ${user.name}/${repo.name}: 成功`);
-          } else {
-            report.push(`❌ ${user.name}/${repo.name}: 失败 (${response.status})`);
-          }
+          // GitHub 只认 commit 算仓库活动，先写心跳重置 60 天计时器
+          const beat = await this.heartbeatCommit(user.name, repo.name, ref, user.token);
+          // 任务本身靠 dispatch 驱动，schedule 被停用也不影响
+          const run = await this.dispatchWorkflow(user.name, repo.name, workflow, ref, user.token);
+
+          const status = beat.ok ? (run.ok ? "✅" : "⚠️") : "❌";
+          report.push(`${status} ${user.name}/${repo.name}: ${beat.message}；${run.message}`);
+          if (beat.ok) successCount++;
         } catch (err) {
           report.push(`❌ ${user.name}/${repo.name}: 错误 - ${err.message}`);
         }
@@ -214,6 +227,85 @@ export default {
     }
     
     return { report, successCount, totalCount };
+  },
+
+  // 心跳提交：只有真实 commit 才会重置 GitHub 的 60 天空闲计时器，默认 20 天内不重复提交
+  async heartbeatCommit(owner, repo, ref, token, maxAgeDays = 20) {
+    const api = `https://api.github.com/repos/${owner}/${repo}/contents/.keepalive`;
+    const headers = {
+      "Authorization": `Bearer ${token}`,
+      "Accept": "application/vnd.github.v3+json",
+      "User-Agent": "CF-Worker-ZQ-SyncAction"
+    };
+
+    let sha = null;
+    let lastBeat = 0;
+    const getRes = await fetch(`${api}?ref=${encodeURIComponent(ref)}`, { headers });
+
+    if (getRes.ok) {
+      const data = await getRes.json();
+      sha = data.sha;
+      try {
+        const prev = JSON.parse(atob((data.content || "").replace(/\s/g, "")));
+        lastBeat = Date.parse(prev.updated_at) || 0;
+      } catch (e) {}
+    } else if (getRes.status !== 404) {
+      return { ok: false, message: `读取心跳文件失败 (${getRes.status})` };
+    }
+
+    const idleDays = Math.floor((Date.now() - lastBeat) / 86400000);
+    if (lastBeat && idleDays < maxAgeDays) {
+      return { ok: true, message: `心跳 ${idleDays} 天前，无需重置` };
+    }
+
+    const now = new Date().toISOString();
+    const body = {
+      message: `chore: keepalive ${now.slice(0, 10)}`,
+      content: btoa(JSON.stringify({ updated_at: now })),
+      branch: ref
+    };
+    if (sha) body.sha = sha;
+
+    const putRes = await fetch(api, {
+      method: "PUT",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+
+    if (putRes.ok) return { ok: true, message: `已提交心跳 ${now.slice(0, 10)}` };
+    if (putRes.status === 409) return { ok: false, message: "分支受保护，提交被拒" };
+    return { ok: false, message: `心跳提交失败 (${putRes.status})` };
+  },
+
+  // 触发 workflow，被停用时先 enable 再重试一次
+  async dispatchWorkflow(owner, repo, workflow, ref, token) {
+    const base = `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflow}`;
+    const headers = {
+      "Authorization": `Bearer ${token}`,
+      "Accept": "application/vnd.github.v3+json",
+      "User-Agent": "CF-Worker-ZQ-SyncAction"
+    };
+
+    const dispatch = () => fetch(`${base}/dispatches`, {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ ref })
+    });
+
+    let res = await dispatch();
+    if (res.status === 204) return { ok: true, message: "已触发 workflow" };
+
+    if (res.status === 403 || res.status === 404) {
+      const enable = await fetch(`${base}/enable`, { method: "PUT", headers });
+      if (enable.ok) {
+        res = await dispatch();
+        if (res.status === 204) return { ok: true, message: "已重新启用并触发" };
+        return { ok: false, message: `启用后触发仍失败 (${res.status})` };
+      }
+      return { ok: false, message: `workflow 不可用 (${res.status})，检查是否缺少 workflow_dispatch` };
+    }
+
+    return { ok: false, message: `触发失败 (${res.status})` };
   },
 
   async handleSyncRun(request, env) {
@@ -402,7 +494,7 @@ export default {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ZQ-KeepAction</title>
+  <title>ZQ-SyncAction</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg t='1777024262222' class='icon' viewBox='0 0 1024 1024' version='1.1' xmlns='http://www.w3.org/2000/svg' p-id='5277' width='200' height='200'%3E%3Cpath d='M145.778 128h732.444v170.667L945.778 416V96l-32-32h-800L78.222 96v600.889l35.556 32h248.889l-46.222-67.556H145.778V128z m295.111 600.889l-60.444-92.444 152.889-334.222 60.444-39.111h192l53.333 103.111-53.333 96H896L942.222 576 568.889 960H419.556l96-231.111h-74.667z m0-67.556h181.333L512 917.333l384-387.556H661.333l124.444-199.111h-192L440.889 661.333z m-3.556-266.666h-224v67.556h192l32-67.556z m-60.444 135.111H213.333v67.556h131.556l32-67.556z' p-id='5278'%3E%3C/path%3E%3C/svg%3E">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -605,6 +697,22 @@ export default {
       gap: 8px;
       font-weight: 600;
     }
+    summary.feature-title {
+      margin-bottom: 0;
+      list-style: none;
+      cursor: pointer;
+      user-select: none;
+      padding: 4px 0;
+    }
+    summary.feature-title::-webkit-details-marker { display: none; }
+    summary.feature-title .chev {
+      margin-left: auto;
+      font-size: 12px;
+      color: #64b5f6;
+      transition: transform 0.2s;
+    }
+    details[open] > summary.feature-title { margin-bottom: 15px; }
+    details[open] > summary.feature-title .chev { transform: rotate(180deg); }
     .sync-item {
       background: white;
       border: 1px solid #e3f2fd;
@@ -640,7 +748,7 @@ export default {
 <body>
   <div class="container">
     <div class="header">
-      <h1>🤖 ZQ-KeepAction</h1>
+      <h1>🤖 ZQ-SyncAction</h1>
       <p>轻松管理您的 GitHub Actions 保活与上游同步任务</p>
     </div>
     <div class="content">
@@ -669,9 +777,9 @@ export default {
         </div>
         
         <!-- 保活功能 -->
-        <div class="feature-section">
-          <div class="feature-title">🛡 保活功能</div>
-          <p class="section-desc">触发 GitHub Actions Workflow，防止仓库因 60 天无活动被暂停</p>
+        <details class="feature-section" open>
+          <summary class="feature-title">🛡 保活功能<span class="chev">▾</span></summary>
+          <p class="section-desc">提交心跳 commit 重置 60 天计时器，并触发 Workflow 执行任务</p>
           <div id="keepAliveUsersList"></div>
           <div class="section-action-bar">
             <button class="btn btn-primary btn-sm" onclick="addKeepAliveUser()">+ 添加用户</button>
@@ -681,11 +789,11 @@ export default {
             <h3 style="margin-bottom:10px;">保活结果</h3>
             <pre id="keepAliveResultContent"></pre>
           </div>
-        </div>
+        </details>
         
         <!-- 同步功能 -->
-        <div class="feature-section">
-          <div class="feature-title">🔄 上游同步</div>
+        <details class="feature-section" open>
+          <summary class="feature-title">🔄 上游同步<span class="chev">▾</span></summary>
           <p class="section-desc">直接通过 GitHub API 同步上游仓库分支到目标仓库（force push）</p>
           <div id="syncUsersList"></div>
           <div class="section-action-bar">
@@ -696,7 +804,7 @@ export default {
             <h3 style="margin-bottom:10px;">同步结果</h3>
             <pre id="syncResultContent"></pre>
           </div>
-        </div>
+        </details>
         
         <!-- 保存按钮 -->
         <div class="action-bar">
@@ -892,30 +1000,25 @@ export default {
       (user.repos || []).forEach((repo, repoIndex) => {
         const repoDiv = document.createElement('div');
         repoDiv.className = 'repo-item';
-        const upstreamDisplay = (repo.upstreamUser && repo.upstreamRepo) 
-          ? \`\${repo.upstreamUser}/\${repo.upstreamRepo}\` 
-          : '上游仓库';
+        const upstream = repo.upstream 
+          || ((repo.upstreamUser && repo.upstreamRepo) ? \`\${repo.upstreamUser}/\${repo.upstreamRepo}\` : '');
         repoDiv.innerHTML = \`
           <div class="repo-header">
-            <span style="font-weight:500;color:#333;">\${upstreamDisplay} → \${user.name || ''}/\${repo.name || ''}</span>
+            <span style="font-weight:500;color:#333;">\${upstream || '上游仓库'} → \${user.name || ''}/\${repo.name || ''}</span>
             <button class="btn btn-danger btn-sm" onclick="removeSyncRepo(\${userIndex}, \${repoIndex})">删除</button>
           </div>
           <div class="repo-grid">
-            <div class="form-group" style="margin:0;">
-              <label>上游用户/组织</label>
-              <input type="text" value="\${repo.upstreamUser || ''}" onchange="updateSyncRepo(\${userIndex}, \${repoIndex}, 'upstreamUser', this.value)">
+            <div class="form-group" style="margin:0;grid-column:1 / -1;">
+              <label>上游仓库</label>
+              <input type="text" value="\${upstream}" placeholder="owner/repo" onchange="updateSyncUpstream(\${userIndex}, \${repoIndex}, this.value)">
             </div>
             <div class="form-group" style="margin:0;">
-              <label>上游仓库名称</label>
-              <input type="text" value="\${repo.upstreamRepo || ''}" onchange="updateSyncRepo(\${userIndex}, \${repoIndex}, 'upstreamRepo', this.value)">
+              <label>分支</label>
+              <input type="text" value="\${repo.branch || ''}" placeholder="main" onchange="updateSyncRepo(\${userIndex}, \${repoIndex}, 'branch', this.value)">
             </div>
             <div class="form-group" style="margin:0;">
-              <label>上游仓库分支</label>
-              <input type="text" value="\${repo.branch || ''}" onchange="updateSyncRepo(\${userIndex}, \${repoIndex}, 'branch', this.value)">
-            </div>
-            <div class="form-group" style="margin:0;">
-              <label>目标仓库名称</label>
-              <input type="text" value="\${repo.name || ''}" onchange="updateSyncRepo(\${userIndex}, \${repoIndex}, 'name', this.value)">
+              <label>目标仓库</label>
+              <input type="text" value="\${repo.name || ''}" placeholder="repo" onchange="updateSyncRepo(\${userIndex}, \${repoIndex}, 'name', this.value)">
             </div>
           </div>
         \`;
@@ -940,7 +1043,7 @@ export default {
     
     function addSyncRepo(userIndex) {
       if (!config.syncUsers[userIndex].repos) config.syncUsers[userIndex].repos = [];
-      config.syncUsers[userIndex].repos.push({ name: '', upstreamUser: '', upstreamRepo: '', branch: '' });
+      config.syncUsers[userIndex].repos.push({ name: '', upstream: '', upstreamUser: '', upstreamRepo: '', branch: '' });
       renderSyncRepos(userIndex);
     }
     
@@ -951,6 +1054,19 @@ export default {
     
     function updateSyncRepo(userIndex, repoIndex, field, value) {
       config.syncUsers[userIndex].repos[repoIndex][field] = value;
+    }
+    
+    // 上游仓库写成 owner/repo 一个框，拆开存回 upstreamUser / upstreamRepo
+    function updateSyncUpstream(userIndex, repoIndex, value) {
+      const repo = config.syncUsers[userIndex].repos[repoIndex];
+      const cleaned = (value || '').trim()
+        .replace(/^https?:\\/\\/github\\.com\\//i, '')
+        .replace(/\\.git$/i, '')
+        .replace(/\\/+$/, '');
+      const parts = cleaned.split('/');
+      repo.upstream = cleaned;
+      repo.upstreamUser = parts[0] || '';
+      repo.upstreamRepo = parts[1] || '';
     }
     
     // ========== 执行函数 ==========
