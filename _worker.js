@@ -777,7 +777,7 @@ export default {
         </div>
         
         <!-- 保活功能 -->
-        <details class="feature-section" open>
+        <details class="feature-section">
           <summary class="feature-title">🛡 保活功能<span class="chev">▾</span></summary>
           <p class="section-desc">提交心跳 commit 重置 60 天计时器，并触发 Workflow 执行任务</p>
           <div id="keepAliveUsersList"></div>
@@ -792,7 +792,7 @@ export default {
         </details>
         
         <!-- 同步功能 -->
-        <details class="feature-section" open>
+        <details class="feature-section">
           <summary class="feature-title">🔄 上游同步<span class="chev">▾</span></summary>
           <p class="section-desc">直接通过 GitHub API 同步上游仓库分支到目标仓库（force push）</p>
           <div id="syncUsersList"></div>
